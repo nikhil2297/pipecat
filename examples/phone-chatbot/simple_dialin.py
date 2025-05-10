@@ -24,7 +24,9 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.google.llm import GoogleLLMService
 from pipecat.transports.services.daily import DailyDialinSettings, DailyParams, DailyTransport
+from silence_watcher import SilenceWatcher
 
 load_dotenv(override=True)
 
@@ -97,10 +99,19 @@ async def main(
         voice_id="b7d50908-b17c-442d-ad8d-810c63997ed9",  # Use Helpful Woman voice by default
     )
 
+    silence_watcher = SilenceWatcher(
+        tts=tts, 
+        session_manager=session_manager,
+        prompt_text="Are you still there?",
+        threshold_secs=10,  
+        max_prompts=3
+    )
+
     # ------------ FUNCTION DEFINITIONS ------------
 
     async def terminate_call(params: FunctionCallParams):
         """Function the bot can call to terminate the call upon completion of a voicemail message."""
+        await silence_watcher.cleanup()
         if session_manager:
             # Mark that the call was terminated by the bot
             session_manager.call_flow_state.set_call_terminated()
@@ -125,7 +136,8 @@ async def main(
     system_instruction = """You are Chatbot, a friendly, helpful robot. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters in your answers. Respond to what the user said in a creative and helpful way, but keep your responses brief. Start by introducing yourself. If the user ends the conversation, **IMMEDIATELY** call the `terminate_call` function. """
 
     # Initialize LLM
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+    # llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+    llm = GoogleLLMService(api_key=os.getenv("GOOGLE_API_KEY"))
 
     # Register functions with the LLM
     llm.register_function("terminate_call", terminate_call)
@@ -143,6 +155,7 @@ async def main(
     pipeline = Pipeline(
         [
             transport.input(),  # Transport user input
+            silence_watcher,
             context_aggregator.user(),  # User responses
             llm,  # LLM
             tts,  # TTS
@@ -153,7 +166,7 @@ async def main(
 
     # Create pipeline task
     task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
-
+    silence_watcher.set_task(task)
     # ------------ EVENT HANDLERS ------------
 
     @transport.event_handler("on_first_participant_joined")
@@ -165,6 +178,7 @@ async def main(
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
         logger.debug(f"Participant left: {participant}, reason: {reason}")
+        await silence_watcher.cleanup()
         await task.cancel()
 
     # ------------ RUN PIPELINE ------------
@@ -173,7 +187,15 @@ async def main(
         logger.debug("Running in test mode (can be tested in Daily Prebuilt)")
 
     runner = PipelineRunner()
-    await runner.run(task)
+    try:
+        await runner.run(task)
+    except Exception as e:
+        logger.error(f"Error running pipeline: {e}")
+        # Make sure we get a call summary even on error
+        await silence_watcher.cleanup()
+    finally:
+        # Log that the call has ended
+        logger.info("Call ended")
 
 
 if __name__ == "__main__":
